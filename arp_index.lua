@@ -6,9 +6,9 @@
 --
 
 local ControlSpec = require "controlspec"
-local Graph = require "mark_eats/graph"
-local MusicUtil = require "mark_eats/musicutil"
-local Passersby = require "mark_eats/passersby"
+local Graph = require "graph"
+local MusicUtil = require "musicutil"
+local Passersby = require "passersby"
 -- local Socket = require "socket"
 -- local Http = require "socket.http"
 
@@ -56,8 +56,8 @@ function init()
     stock_graph:add_point(util.linlin(0, 14, 0, 6, i), math.random(0, 100))
   end
   
-  local screen_refresh_metro = metro.alloc()
-  screen_refresh_metro.callback = function()
+  local screen_refresh_metro = metro.init()
+  screen_refresh_metro.event = function()
     if screen_dirty then
       screen_dirty = false
       redraw()
