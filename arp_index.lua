@@ -9,7 +9,7 @@
 local ControlSpec = require "controlspec"
 local Graph = require "graph"
 local MusicUtil = require "musicutil"
-local Passersby = require "passersby"
+local Passersby = require "passersby/lib/passersby_engine"
 -- local Socket = require "socket"
 -- local Http = require "socket.http"
 
