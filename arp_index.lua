@@ -11,10 +11,16 @@
 
 local ControlSpec = require "controlspec"
 local Graph = require "graph"
+local BeatClock = require "beatclock"
 local MusicUtil = require "musicutil"
 local Passersby = require "passersby/lib/passersby_engine"
 
 engine.name = "Passersby"
+
+local options = {}
+options.OUTPUT = {"Audio", "MIDI", "Audio + MIDI"}
+options.STEP_LENGTH_NAMES = {"1 bar", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12", "1/16", "1/24", "1/32", "1/48", "1/64"}
+options.STEP_LENGTH_DIVIDERS = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}
 
 local RANGES = {"1d", "1m", "3m", "1y"}
 local RANGE_NAMES = {"1 day", "1 month", "3 months", "1 year"}
@@ -31,11 +37,18 @@ local num_companies = 0
 local companies = {}
 local note_steps = 8
 local notes = {}
-
-local current_step = 1
+local scale
 
 local stock_graph
-local notes_graph
+
+local beat_clock
+local current_step = 1
+
+local midi_in_device
+local midi_in_channel
+local midi_out_device
+local midi_out_channel
+local midi_clock_in_device
 
 
 local function curl_request(url)
@@ -77,18 +90,19 @@ local function get_stock_price_json(symbol, range)
     interval = 3
   end
   
-  local url = API_BASE_URL .. "stock/" .. symbol .. "/chart/" .. range .. "?filter=close&chartInterval=" .. interval .. "&token=" .. API_TOKEN
+  local url = API_BASE_URL .. "stock/" .. symbol .. "/chart/" .. range .. "?filter=close,change&chartInterval=" .. interval .. "&token=" .. API_TOKEN
   return curl_request(url)
 end
 
 local function process_stock_price_json(json)
   
+  local current_price
+  local price_change
+  
   local data = {
     price_history = {},
     min_price = 9999,
     max_price = 0,
-    current_price = nil,
-    price_change = nil
   }
   
   for entry in string.gmatch(json, "{(.-)}") do
@@ -97,18 +111,22 @@ local function process_stock_price_json(json)
       table.insert(data.price_history, closing_price)
       data.min_price = math.min(data.min_price, closing_price)
       data.max_price = math.max(data.max_price, closing_price)
-      data.current_price = closing_price
-      data.price_change = tonumber(string.match(entry, "\"change\":([%d.-]+)"))
+      current_price = closing_price
+      price_change = tonumber(string.match(entry, "\"change\":([%d.-]+)"))
     end
   end
   
   print("Got prices", #data.price_history)
   
   if current_range_id == 1 then --TODO could change??
-    data.price_change = util.round(data.price_history[#data.price_history] - data.price_history[1], 0.001)
+    price_change = util.round(data.price_history[#data.price_history] - data.price_history[1], 0.001)
   end
   
   companies[current_company_id].data[current_range_id] = data
+  if not companies[current_company_id].current_price or current_range_id == 1 then
+    companies[current_company_id].current_price = current_price
+    companies[current_company_id].price_change = price_change
+  end
   
 end
 
@@ -139,24 +157,113 @@ local function generate_notes()
     
     local data = companies[current_company_id].data[current_range_id]
     local num_prices = #data.price_history
+    local scale_len = #scale
     
     for i = 1, note_steps do
-      local price = data.price_history[util.round(util.linlin(1, note_steps, 1, num_prices, i))]
-      table.insert(notes, util.round(util.linlin(data.min_price, data.max_price, 1, 13, price)))
+      local note = {}
+      
+      local price_position = util.linlin(1, note_steps, 1, num_prices, i)
+      local prev_price = data.price_history[math.floor(price_position)]
+      local next_price = data.price_history[math.ceil(price_position)]
+      local price = util.linlin(0, 1, prev_price, next_price, price_position % 1)
+      local scale_position = util.round(util.linlin(data.min_price, data.max_price, 1, scale_len, price))
+      
+      note.num = scale[scale_position]
+      note.x = util.round(util.linlin(1, note_steps, 0, stock_graph:get_width(), i) + stock_graph:get_x())
+      note.y = util.round(util.linlin(1, scale_len, stock_graph:get_height(), 0, scale_position) + stock_graph:get_y())
+      note.active = false
+      table.insert(notes, note)
     end
   
   end
 end
 
-local function update_notes_graph()
+
+local function note_on(note_num)
   
-  notes_graph:remove_all_points()
+  -- print("note_on", note_num, MusicUtil.note_num_to_name(note_num, true))
   
-  for i = 1, #notes do
-    notes_graph:add_point(i, notes[i])
+  -- Audio engine out
+  if params:get("output") == 1 or params:get("output") == 3 then
+    engine.noteOn(note_num, MusicUtil.note_num_to_freq(note_num), 1)
+  end
+  
+  -- MIDI out
+  if (params:get("output") == 2 or params:get("output") == 3) then
+    midi_out_device:note_on(note_num, 127, midi_out_channel)
   end
   
 end
+
+local function note_off(note_num)
+  
+  -- print("note_off", note_num, MusicUtil.note_num_to_name(note_num, true))
+  
+  -- Audio engine out
+  if params:get("output") == 1 or params:get("output") == 3 then
+    engine.noteOff(note_num)
+  end
+  
+  -- MIDI out
+  if (params:get("output") == 2 or params:get("output") == 3) then
+    midi_out_device:note_off(note_num, nil, midi_out_channel)
+  end
+  
+end
+
+local function all_notes_kill()
+  
+  -- Audio engine out
+  engine.noteKillAll()
+  
+  for _, n in pairs(notes) do
+    if n.active then
+      -- MIDI out
+      if (params:get("output") == 2 or params:get("output") == 3) then
+        midi_out_device:note_off(n.num, 96, midi_out_channel)
+      end
+      n.active = false
+    end
+  end
+end
+
+
+-- Beat clock
+
+local function advance_step()
+  
+  if #notes == note_steps then
+    
+    -- Note offs
+    for _, n in pairs(notes) do
+      if n.active then
+        note_off(n.num)
+        n.active = false
+      end
+    end
+    
+    -- Advance
+    current_step = current_step % note_steps + 1
+    
+    -- Note on
+    note_on(notes[current_step].num)
+    notes[current_step].active = true
+    
+    screen_dirty = true
+  
+  end
+end
+
+local function stop()
+  all_notes_kill()
+end
+
+local function reset_step()
+  current_step = 0
+  beat_clock:reset()
+  -- TODO does this call stop or do I need to kill notes here?
+end
+
 
 -- Encoder input
 function enc(n, delta)
@@ -168,7 +275,6 @@ function enc(n, delta)
       current_company_id = util.clamp(current_company_id + delta, 1, num_companies)
       generate_notes()
       update_stock_graph()
-      update_notes_graph()
     end
   
   elseif n == 2 then
@@ -176,7 +282,6 @@ function enc(n, delta)
       current_range_id = util.clamp(current_range_id + delta, 1, #RANGES)
       generate_notes()
       update_stock_graph()
-      update_notes_graph()
     end
           
   elseif n == 3 then
@@ -191,7 +296,13 @@ function key(n, z)
   if z == 1 then
     if n == 2 then
       
-      
+      if not beat_clock.external then
+        if beat_clock.playing then
+          beat_clock:stop()
+        else
+          beat_clock:start()
+        end
+      end
       
     elseif n == 3 then
       
@@ -203,7 +314,6 @@ function key(n, z)
           
           generate_notes()
           update_stock_graph()
-          update_notes_graph()
         end
         
       else
@@ -220,16 +330,33 @@ function key(n, z)
 end
 
 
+-- MIDI events
+local function midi_event(data)
+  local msg = Midi.to_msg(data)
+  if msg.ch == midi_in_channel then
+    print("MIDI in TODO", msg.type, msg)
+  end
+end
+
+local function midi_clock_event(data)
+  beat_clock:process_midi(data)
+end
+
+
 function init()
   
-  Passersby.add_params()
-  
   stock_graph = Graph.new(1, 10, "lin", 0, 100, "lin", "line", false, false)
-  stock_graph:set_position_and_size(3, 27, 122, 34)
+  stock_graph:set_position_and_size(4, 27, 120, 34)
   stock_graph:set_active(false)
   
-  notes_graph = Graph.new(1, note_steps, "lin", 1, 13, "lin", "point", false, false)
-  notes_graph:set_position_and_size(3, 27, 122, 34)
+  scale = MusicUtil.generate_scale(60, "major", 1)
+  
+  midi_in_device = midi.connect(1)
+  midi_in_device.event = midi_event
+  midi_clock_in_device = midi.connect(1)
+  midi_clock_in_device.event = midi_clock_event
+  
+  midi_out_device = midi.connect(1)
   
   local screen_refresh_metro = metro.init()
   screen_refresh_metro.event = function()
@@ -239,11 +366,91 @@ function init()
     end
   end
   
-  screen_refresh_metro:start(1 / SCREEN_FRAMERATE)
-  screen.aa(1)
+  beat_clock = BeatClock.new()
+  
+  beat_clock.on_step = advance_step
+  beat_clock.on_stop = stop
+  beat_clock.on_select_internal = function()
+    beat_clock:start()
+    screen_dirty = true
+  end
+  beat_clock.on_select_external = function()
+    reset_step()
+    screen_dirty = true
+  end
   
   local json = get_companies_json()
   process_companies_json(json)
+  
+  -- Add params
+  
+  params:add{type = "option", id = "output", name = "Output", options = options.OUTPUT, action = all_notes_kill}
+  
+  params:add{type = "number", id = "midi_in_device", name = "MIDI In Device", min = 1, max = 4, default = 1,
+    action = function(value)
+      midi_in_device.event = nil
+      midi_in_device = midi.connect(value)
+      midi_in_device.event = midi_event
+    end}
+  
+  params:add{type = "number", id = "midi_in_channel", name = "MIDI In Channel", min = 1, max = 16, default = 1,
+    action = function(value)
+      midi_in_channel = value
+    end}
+  
+  params:add{type = "number", id = "midi_out_device", name = "MIDI Out Device", min = 1, max = 4, default = 1,
+    action = function(value)
+      midi_out_device = midi.connect(value)
+    end}
+  
+  params:add{type = "number", id = "midi_out_channel", name = "MIDI Out Channel", min = 1, max = 16, default = 1,
+    action = function(value)
+      all_notes_kill()
+      midi_out_channel = value
+    end}
+  
+  params:add{type = "option", id = "clock", name = "Clock", options = {"Internal", "External"}, default = beat_clock.external or 2 and 1,
+    action = function(value)
+      beat_clock:clock_source_change(value)
+    end}
+  
+  params:add{type = "number", id = "midi_clock_in_device", name = "Clock MIDI In Device", min = 1, max = 4, default = 1,
+    action = function(value)
+      midi_clock_in_device.event = nil
+      midi_clock_in_device = midi.connect(value)
+      midi_clock_in_device.event = midi_clock_event
+    end}
+  
+  params:add{type = "option", id = "clock_out", name = "Clock Out", options = {"Off", "On"}, default = beat_clock.send or 2 and 1,
+    action = function(value)
+      if value == 1 then beat_clock.send = false
+      else beat_clock.send = true end
+    end}
+  
+  params:add{type = "number", id = "bpm", name = "BPM", min = 1, max = 240, default = beat_clock.bpm,
+    action = function(value)
+      beat_clock:bpm_change(value)
+      screen_dirty = true
+    end}
+  
+  params:add{type = "option", id = "step_length", name = "Step Length", options = options.STEP_LENGTH_NAMES, default = 6,
+    action = function(value)
+      beat_clock.ticks_per_step = 96 / options.STEP_LENGTH_DIVIDERS[value]
+      beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 4
+      beat_clock:bpm_change(beat_clock.bpm)
+    end}
+    
+  params:add_separator()
+  
+  Passersby.add_params()
+  
+  midi_in_channel = params:get("midi_in_channel")
+  midi_out_channel = params:get("midi_out_channel")
+
+  -- Start metros
+  screen.aa(1)  
+  screen_refresh_metro:start(1 / SCREEN_FRAMERATE)
+  beat_clock:start()
   
 end
 
@@ -272,26 +479,48 @@ function redraw()
     screen.level(15)
     screen.text(companies[current_company_id].symbol)
     
-    if companies[current_company_id].data[current_range_id] then
-      
-      if current_price and price_change then
-        screen.move(125, 20)
-        screen.level(3)
-        local price_change_string = price_change
-        if price_change > 0 then price_change_string = "+" .. price_change_string end
-        screen.text_right(current_price .. " " .. price_change_string)
-      end
-      
-      stock_graph:redraw()
-      notes_graph:redraw()
-    
-    end
-    
     screen.move(3, 20)
     screen.level(3)
     screen.text(RANGE_NAMES[current_range_id])
-    
     screen.fill()
+    
+    if companies[current_company_id].current_price and companies[current_company_id].price_change then
+      screen.move(125, 20)
+      screen.level(3)
+      local price_change_string = companies[current_company_id].price_change
+      if companies[current_company_id].price_change > 0 then price_change_string = "+" .. price_change_string end
+      screen.text_right(companies[current_company_id].current_price .. " " .. price_change_string)
+    end
+    
+    if companies[current_company_id].data[current_range_id] then
+      
+      stock_graph:redraw()
+      
+      local BACK_SIZE = 6.5
+      local FRONT_SIZE = 3.5
+      
+      for _, n in pairs(notes) do
+        if n.active then
+          
+          screen.move(n.x, n.y - BACK_SIZE)
+          screen.line(n.x + BACK_SIZE, n.y)
+          screen.line(n.x, n.y + BACK_SIZE)
+          screen.line(n.x - BACK_SIZE, n.y)
+          screen.close()
+          screen.level(0)
+          screen.fill()
+          
+          screen.move(n.x, n.y - FRONT_SIZE)
+          screen.line(n.x + FRONT_SIZE, n.y)
+          screen.line(n.x, n.y + FRONT_SIZE)
+          screen.line(n.x - FRONT_SIZE, n.y)
+          screen.close()
+          screen.level(15)
+          screen.stroke()
+        end
+      end
+    
+    end
   
   end
   
