@@ -30,12 +30,15 @@ local API_BASE_URL = "https://cloud.iexapis.com/v1/"
 local SCREEN_FRAMERATE = 15
 local screen_dirty = true
 
+local downloading = false
+local steps_changed_timeout = 0
+local show_steps_changed = false
+
 local current_company_id = 1
 local current_range_id = 1
 
 local num_companies = 0
 local companies = {}
-local note_steps = 8
 local notes = {}
 local scale
 
@@ -48,135 +51,6 @@ local midi_in_device
 local midi_in_channel
 local midi_out_device
 local midi_out_channel
-local midi_clock_in_device
-
-
-local function curl_request(url)
-  print("Requesting...", url)
-  return util.os_capture( "curl -s \"" .. url .. "\"", true)
-end
-
-local function get_companies_json()
-  local url = API_BASE_URL .. "stock/market/list/mostactive?listLimit=100&filter=symbol,companyName&token=" .. API_TOKEN
-  return curl_request(url)
-end
-
-local function process_companies_json(json)
-  companies = {}
-  for entry in string.gmatch(json, "{(.-)}") do
-    table.insert(companies, {
-      symbol = string.match(entry, "\"symbol\":\"(.-)\""),
-      name =  string.match(entry, "\"companyName\":\"(.-)\""),
-      data = {}
-    })
-  end
-  table.sort(companies, function (k1, k2) return k1.symbol < k2.symbol end)
-  -- table.sort(companies, function (k1, k2) return k1.name:lower() < k2.name:lower() end) --TODO
-  
-  num_companies = #companies
-  current_company_id = util.clamp(current_company_id, 1, num_companies)
-  screen_dirty = true
-  
-  print("Got companies", num_companies)
-end
-
-local function get_stock_price_json(symbol, range)
-  range = range or "1m"
-  
-  local interval = 1
-  if range == "1d" then
-    interval = 4
-  elseif range == "1y" then
-    interval = 3
-  end
-  
-  local url = API_BASE_URL .. "stock/" .. symbol .. "/chart/" .. range .. "?filter=close,change&chartInterval=" .. interval .. "&token=" .. API_TOKEN
-  return curl_request(url)
-end
-
-local function process_stock_price_json(json)
-  
-  local current_price
-  local price_change
-  
-  local data = {
-    price_history = {},
-    min_price = 9999,
-    max_price = 0,
-  }
-  
-  for entry in string.gmatch(json, "{(.-)}") do
-    local closing_price = tonumber(string.match(entry, "\"close\":([%d.-]+)"))
-    if closing_price then
-      table.insert(data.price_history, closing_price)
-      data.min_price = math.min(data.min_price, closing_price)
-      data.max_price = math.max(data.max_price, closing_price)
-      current_price = closing_price
-      price_change = tonumber(string.match(entry, "\"change\":([%d.-]+)"))
-    end
-  end
-  
-  print("Got prices", #data.price_history)
-  
-  if current_range_id == 1 then --TODO could change??
-    price_change = util.round(data.price_history[#data.price_history] - data.price_history[1], 0.001)
-  end
-  
-  companies[current_company_id].data[current_range_id] = data
-  if not companies[current_company_id].current_price or current_range_id == 1 then
-    companies[current_company_id].current_price = current_price
-    companies[current_company_id].price_change = price_change
-  end
-  
-end
-
-local function update_stock_graph()
-  
-  stock_graph:remove_all_points()
-  
-  if num_companies > 0 and companies[current_company_id].data[current_range_id] then
-  
-    local data = companies[current_company_id].data[current_range_id]
-    local num_prices = #data.price_history
-    
-    for i = 1, num_prices do
-      stock_graph:add_point(i, data.price_history[i])
-    end
-    
-    stock_graph:set_x_max(num_prices)
-    stock_graph:set_y_min(data.min_price)
-    stock_graph:set_y_max(data.max_price)
-  
-  end
-end
-
-local function generate_notes()
-  notes = {}
-  
-  if num_companies > 0 and companies[current_company_id].data[current_range_id] then
-    
-    local data = companies[current_company_id].data[current_range_id]
-    local num_prices = #data.price_history
-    local scale_len = #scale
-    
-    for i = 1, note_steps do
-      local note = {}
-      
-      local price_position = util.linlin(1, note_steps, 1, num_prices, i)
-      local prev_price = data.price_history[math.floor(price_position)]
-      local next_price = data.price_history[math.ceil(price_position)]
-      local price = util.linlin(0, 1, prev_price, next_price, price_position % 1)
-      local scale_position = util.round(util.linlin(data.min_price, data.max_price, 1, scale_len, price))
-      
-      note.num = scale[scale_position]
-      note.x = util.round(util.linlin(1, note_steps, 0, stock_graph:get_width(), i) + stock_graph:get_x())
-      note.y = util.round(util.linlin(1, scale_len, stock_graph:get_height(), 0, scale_position) + stock_graph:get_y())
-      note.active = false
-      table.insert(notes, note)
-    end
-  
-  end
-end
 
 
 local function note_on(note_num)
@@ -232,7 +106,7 @@ end
 
 local function advance_step()
   
-  if #notes == note_steps then
+  if #notes == params:get("num_steps") then
     
     -- Note offs
     for _, n in pairs(notes) do
@@ -243,7 +117,7 @@ local function advance_step()
     end
     
     -- Advance
-    current_step = current_step % note_steps + 1
+    current_step = current_step % params:get("num_steps") + 1
     
     -- Note on
     note_on(notes[current_step].num)
@@ -256,6 +130,8 @@ end
 
 local function stop()
   all_notes_kill()
+  current_step = 0
+  beat_clock:reset()
 end
 
 local function reset_step()
@@ -265,43 +141,208 @@ local function reset_step()
 end
 
 
+-- Get data
+
+local function curl_request(url)
+  print("Requesting...", url)
+  return util.os_capture( "curl -s \"" .. url .. "\"", true)
+end
+
+local function get_companies_json()
+  local url = API_BASE_URL .. "stock/market/list/mostactive?listLimit=100&filter=symbol,companyName&token=" .. API_TOKEN
+  return curl_request(url)
+end
+
+local function process_companies_json(json)
+  companies = {}
+  for entry in string.gmatch(json, "{(.-)}") do
+    table.insert(companies, {
+      symbol = string.match(entry, "\"symbol\":\"(.-)\""),
+      name =  string.match(entry, "\"companyName\":\"(.-)\""),
+      data = {}
+    })
+  end
+  table.sort(companies, function (k1, k2) return k1.symbol < k2.symbol end)
+  
+  num_companies = #companies
+  current_company_id = util.clamp(current_company_id, 1, num_companies)
+  downloading = false
+  screen_dirty = true
+  
+  print("Got companies", num_companies)
+end
+
+local function get_companies()
+  downloading = true
+  redraw()
+  local json = get_companies_json()
+  process_companies_json(json)
+end
+
+local function get_stock_price_json(symbol, range)
+  range = range or "1m"
+  
+  local filter = "close,change"
+  local interval = 1
+  if range == "1d" then
+    interval = 4
+    filter = "close"
+  elseif range == "1y" then
+    interval = 3
+  end
+  
+  local url = API_BASE_URL .. "stock/" .. symbol .. "/chart/" .. range .. "?filter=" .. filter .. "&chartInterval=" .. interval .. "&token=" .. API_TOKEN
+  return curl_request(url)
+end
+
+local function process_stock_price_json(json, range)
+  
+  local current_price
+  local price_change
+  
+  local data = {
+    price_history = {},
+    min_price = 9999,
+    max_price = 0,
+  }
+  
+  for entry in string.gmatch(json, "{(.-)}") do
+    local closing_price = tonumber(string.match(entry, "\"close\":([%d.-]+)"))
+    if closing_price then
+      table.insert(data.price_history, closing_price)
+      data.min_price = math.min(data.min_price, closing_price)
+      data.max_price = math.max(data.max_price, closing_price)
+      current_price = closing_price
+      price_change = tonumber(string.match(entry, "\"change\":([%d.-]+)"))
+    end
+  end
+  
+  if range == "1d" then
+    price_change = util.round(data.price_history[#data.price_history] - data.price_history[1], 0.001)
+  end
+  
+  -- Find range ID
+  local range_id
+  for k, v in pairs(RANGES) do
+    if v == range then
+      range_id = k
+      break
+    end
+  end
+  
+  companies[current_company_id].data[range_id] = data
+  if not companies[current_company_id].current_price or range == "1d" then
+    companies[current_company_id].current_price = current_price
+    companies[current_company_id].price_change = price_change
+  end
+  
+  print("Got prices", #data.price_history)
+  
+end
+
+local function get_stock_prices(symbol)
+  print("Getting", symbol)
+  beat_clock:stop()
+  downloading = true
+  redraw()
+  
+  for _, r in pairs(RANGES) do
+    local json = get_stock_price_json(symbol, r)
+    process_stock_price_json(json, r)
+  end
+  
+  downloading = false
+  beat_clock:start()
+  print("Got all", symbol)
+end
+
+local function update_stock_graph()
+  
+  stock_graph:remove_all_points()
+  
+  if num_companies > 0 and companies[current_company_id].data[current_range_id] then
+  
+    local data = companies[current_company_id].data[current_range_id]
+    local num_prices = #data.price_history
+    
+    for i = 1, num_prices do
+      stock_graph:add_point(i, data.price_history[i])
+    end
+    
+    stock_graph:set_x_max(num_prices)
+    stock_graph:set_y_min(data.min_price)
+    stock_graph:set_y_max(data.max_price)
+  
+  end
+end
+
+local function generate_notes()
+  notes = {}
+  
+  if num_companies > 0 and companies[current_company_id].data[current_range_id] then
+    
+    local data = companies[current_company_id].data[current_range_id]
+    local num_prices = #data.price_history
+    local scale_len = #scale
+    
+    for i = 1, params:get("num_steps") do
+      local note = {}
+      
+      local price_position = util.linlin(1, params:get("num_steps"), 1, num_prices, i)
+      local prev_price = data.price_history[math.floor(price_position)]
+      local next_price = data.price_history[math.ceil(price_position)]
+      local price = util.linlin(0, 1, prev_price, next_price, price_position % 1)
+      local scale_position = util.round(util.linlin(data.min_price, data.max_price, 1, scale_len, price))
+      
+      note.num = scale[scale_position]
+      note.x = util.round(util.linlin(1, params:get("num_steps"), 0, stock_graph:get_width(), i) + stock_graph:get_x())
+      note.y = util.round(util.linlin(1, scale_len, stock_graph:get_height(), 0, scale_position) + stock_graph:get_y())
+      note.active = i == current_step
+      table.insert(notes, note)
+    end
+  
+  end
+end
+
+
 -- Encoder input
 function enc(n, delta)
   
-  delta = util.clamp(delta, -1, 1)
+  if not downloading then
   
-  if n == 1 then
-    if num_companies > 0 then
-      current_company_id = util.clamp(current_company_id + delta, 1, num_companies)
-      generate_notes()
-      update_stock_graph()
-    end
-  
-  elseif n == 2 then
-    if num_companies > 0 then
-      current_range_id = util.clamp(current_range_id + delta, 1, #RANGES)
-      generate_notes()
-      update_stock_graph()
-    end
-          
-  elseif n == 3 then
+    delta = util.clamp(delta, -1, 1)
     
+    if n == 1 then
+      if num_companies > 0 then
+        current_company_id = util.clamp(current_company_id + delta, 1, num_companies)
+        generate_notes()
+        update_stock_graph()
+      end
+    
+    elseif n == 2 then
+      if num_companies > 0 then
+        current_range_id = util.clamp(current_range_id + delta, 1, #RANGES)
+        generate_notes()
+        update_stock_graph()
+      end
+      
+    elseif n == 3 then
+      params:delta("num_steps", delta)
+    end
+    
+    screen_dirty = true
   end
-  
-  screen_dirty = true
 end
 
 -- Key input
 function key(n, z)
-  if z == 1 then
+  if z == 1 and not downloading then
     if n == 2 then
       
-      if not beat_clock.external then
-        if beat_clock.playing then
-          beat_clock:stop()
-        else
-          beat_clock:start()
-        end
+      if beat_clock.playing then
+        beat_clock:stop()
+      else
+        beat_clock:start()
       end
       
     elseif n == 3 then
@@ -309,16 +350,13 @@ function key(n, z)
       if num_companies > 0 then
       
         if not companies[current_company_id].data[current_range_id] then
-          local json = get_stock_price_json(companies[current_company_id].symbol, RANGES[current_range_id])
-          process_stock_price_json(json)
-          
+          get_stock_prices(companies[current_company_id].symbol)
           generate_notes()
           update_stock_graph()
         end
         
       else
-        local json = get_companies_json()
-        process_companies_json(json)
+        get_companies()
         
       end
       
@@ -338,10 +376,6 @@ local function midi_event(data)
   end
 end
 
-local function midi_clock_event(data)
-  beat_clock:process_midi(data)
-end
-
 
 function init()
   
@@ -353,13 +387,12 @@ function init()
   
   midi_in_device = midi.connect(1)
   midi_in_device.event = midi_event
-  midi_clock_in_device = midi.connect(1)
-  midi_clock_in_device.event = midi_clock_event
   
   midi_out_device = midi.connect(1)
   
   local screen_refresh_metro = metro.init()
   screen_refresh_metro.event = function()
+    update()
     if screen_dirty then
       screen_dirty = false
       redraw()
@@ -370,17 +403,8 @@ function init()
   
   beat_clock.on_step = advance_step
   beat_clock.on_stop = stop
-  beat_clock.on_select_internal = function()
-    beat_clock:start()
-    screen_dirty = true
-  end
-  beat_clock.on_select_external = function()
-    reset_step()
-    screen_dirty = true
-  end
   
-  local json = get_companies_json()
-  process_companies_json(json)
+  get_companies()
   
   -- Add params
   
@@ -409,18 +433,6 @@ function init()
       midi_out_channel = value
     end}
   
-  params:add{type = "option", id = "clock", name = "Clock", options = {"Internal", "External"}, default = beat_clock.external or 2 and 1,
-    action = function(value)
-      beat_clock:clock_source_change(value)
-    end}
-  
-  params:add{type = "number", id = "midi_clock_in_device", name = "Clock MIDI In Device", min = 1, max = 4, default = 1,
-    action = function(value)
-      midi_clock_in_device.event = nil
-      midi_clock_in_device = midi.connect(value)
-      midi_clock_in_device.event = midi_clock_event
-    end}
-  
   params:add{type = "option", id = "clock_out", name = "Clock Out", options = {"Off", "On"}, default = beat_clock.send or 2 and 1,
     action = function(value)
       if value == 1 then beat_clock.send = false
@@ -433,11 +445,18 @@ function init()
       screen_dirty = true
     end}
   
-  params:add{type = "option", id = "step_length", name = "Step Length", options = options.STEP_LENGTH_NAMES, default = 6,
+  params:add{type = "option", id = "step_length", name = "Step Length", options = options.STEP_LENGTH_NAMES, default = 8,
     action = function(value)
       beat_clock.ticks_per_step = 96 / options.STEP_LENGTH_DIVIDERS[value]
       beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 4
       beat_clock:bpm_change(beat_clock.bpm)
+    end}
+    
+  params:add{type = "number", id = "num_steps", name = "Steps", min = 1, max = 32, default = 4,
+    action = function(value)
+      steps_changed_timeout = 1
+      show_steps_changed = true
+      generate_notes()
     end}
     
   params:add_separator()
@@ -455,69 +474,111 @@ function init()
 end
 
 
+function update()
+  if steps_changed_timeout > 0 then
+    steps_changed_timeout = steps_changed_timeout - 1 / SCREEN_FRAMERATE
+  else
+    show_steps_changed = false
+    screen_dirty = true
+  end
+  
+end
+
 function redraw()
   
   screen.clear()
   
-  if num_companies == 0 then
+  -- Downloading
+  if downloading then
+    
     screen.move(63, 34)
     screen.level(3)
-    screen.text_center("No companies. K3 to retry.") --TODO show downloading/fail status?
-  
-  else
-  
-    local title = companies[current_company_id].symbol .. " " .. companies[current_company_id].name
-    if title:len() > 25 then
-      title = string.sub(title, 1, 25)
-      title = string.gsub(title, "[%p%s]+$", "") -- Trim punctuation and spaces
-      title = title .. "..."
-    end
-    screen.move(3, 9)
-    screen.level(3)
-    screen.text(title)
-    screen.move(3, 9)
-    screen.level(15)
-    screen.text(companies[current_company_id].symbol)
-    
-    screen.move(3, 20)
-    screen.level(3)
-    screen.text(RANGE_NAMES[current_range_id])
+    screen.text_center("Downloading...")
     screen.fill()
     
-    if companies[current_company_id].current_price and companies[current_company_id].price_change then
-      screen.move(125, 20)
+  else
+  
+    -- No companies
+    if num_companies == 0 then
+      screen.move(63, 34)
       screen.level(3)
-      local price_change_string = companies[current_company_id].price_change
-      if companies[current_company_id].price_change > 0 then price_change_string = "+" .. price_change_string end
-      screen.text_right(companies[current_company_id].current_price .. " " .. price_change_string)
-    end
+      screen.text_center("No companies, K3 to retry") --TODO show downloading/fail status?
+      screen.fill()
     
-    if companies[current_company_id].data[current_range_id] then
+    -- Company
+    else
+    
+      -- Symbol and name
+      local title = companies[current_company_id].symbol .. " " .. companies[current_company_id].name
+      if title:len() > 25 then
+        title = string.sub(title, 1, 25)
+        title = string.gsub(title, "[%p%s]+$", "") -- Trim punctuation and spaces
+        title = title .. "..."
+      end
+      screen.move(3, 9)
+      screen.level(3)
+      screen.text(title)
+      screen.move(3, 9)
+      screen.level(15)
+      screen.text(companies[current_company_id].symbol)
       
-      stock_graph:redraw()
+      -- Byline
+      screen.move(3, 20)
+      screen.level(3)
+      if show_steps_changed then
+         -- Number of steps
+         screen.text(params:get("num_steps") .. " steps")
+      else
+        -- Range
+        screen.text(RANGE_NAMES[current_range_id])
+      end
+      screen.fill()
       
-      local BACK_SIZE = 6.5
-      local FRONT_SIZE = 3.5
+      -- Price and price change
+      if companies[current_company_id].current_price and companies[current_company_id].price_change then
+        screen.move(125, 20)
+        screen.level(3)
+        local price_change_string = companies[current_company_id].price_change
+        if companies[current_company_id].price_change > 0 then price_change_string = "+" .. price_change_string end
+        screen.text_right("$" .. companies[current_company_id].current_price .. " " .. price_change_string)
+      end
       
-      for _, n in pairs(notes) do
-        if n.active then
-          
-          screen.move(n.x, n.y - BACK_SIZE)
-          screen.line(n.x + BACK_SIZE, n.y)
-          screen.line(n.x, n.y + BACK_SIZE)
-          screen.line(n.x - BACK_SIZE, n.y)
-          screen.close()
-          screen.level(0)
-          screen.fill()
-          
-          screen.move(n.x, n.y - FRONT_SIZE)
-          screen.line(n.x + FRONT_SIZE, n.y)
-          screen.line(n.x, n.y + FRONT_SIZE)
-          screen.line(n.x - FRONT_SIZE, n.y)
-          screen.close()
-          screen.level(15)
-          screen.stroke()
+      -- Graph and notes
+      if companies[current_company_id].data[current_range_id] then
+        
+        stock_graph:redraw()
+        
+        local BACK_SIZE = 6.5
+        local FRONT_SIZE = 3.5
+        
+        for _, n in pairs(notes) do
+          if n.active then
+            
+            screen.move(n.x, n.y - BACK_SIZE)
+            screen.line(n.x + BACK_SIZE, n.y)
+            screen.line(n.x, n.y + BACK_SIZE)
+            screen.line(n.x - BACK_SIZE, n.y)
+            screen.close()
+            screen.level(0)
+            screen.fill()
+            
+            screen.move(n.x, n.y - FRONT_SIZE)
+            screen.line(n.x + FRONT_SIZE, n.y)
+            screen.line(n.x, n.y + FRONT_SIZE)
+            screen.line(n.x - FRONT_SIZE, n.y)
+            screen.close()
+            screen.level(15)
+            screen.stroke()
+          end
         end
+        
+      -- Download prompt
+      else
+        screen.move(3, 42)
+        screen.level(3)
+        screen.text("K3 to download")
+        screen.fill()
+      
       end
     
     end
