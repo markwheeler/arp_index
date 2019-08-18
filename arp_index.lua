@@ -13,9 +13,9 @@ local ControlSpec = require "controlspec"
 local Graph = require "graph"
 local BeatClock = require "beatclock"
 local MusicUtil = require "musicutil"
-local Passersby = require "passersby/lib/passersby_engine"
+local MollyThePoly = require "molly_the_poly/lib/molly_the_poly_engine"
 
-engine.name = "Passersby"
+engine.name = "MollyThePoly"
 
 local options = {}
 options.OUTPUT = {"Audio", "MIDI", "Audio + MIDI"}
@@ -41,11 +41,12 @@ local num_companies = 0
 local companies = {}
 local notes = {}
 local scale
+local sequences = {internal = 1}
+local active_notes = {}
 
 local stock_graph
 
 local beat_clock
-local current_step = 1
 
 local midi_in_device
 local midi_in_channel
@@ -59,12 +60,12 @@ local function note_on(note_num)
   
   -- Audio engine out
   if params:get("output") == 1 or params:get("output") == 3 then
-    engine.noteOn(note_num, MusicUtil.note_num_to_freq(note_num), 1)
+    engine.noteOn(note_num, MusicUtil.note_num_to_freq(note_num), 0.75)
   end
   
   -- MIDI out
   if (params:get("output") == 2 or params:get("output") == 3) then
-    midi_out_device:note_on(note_num, 127, midi_out_channel)
+    midi_out_device:note_on(note_num, 96, midi_out_channel)
   end
   
 end
@@ -90,38 +91,49 @@ local function all_notes_kill()
   -- Audio engine out
   engine.noteKillAll()
   
-  for _, n in pairs(notes) do
-    if n.active then
-      -- MIDI out
-      if (params:get("output") == 2 or params:get("output") == 3) then
-        midi_out_device:note_off(n.num, 96, midi_out_channel)
-      end
-      n.active = false
+  for k, v in pairs(active_notes) do
+    -- MIDI out
+    if (params:get("output") == 2 or params:get("output") == 3) then
+      midi_out_device:note_off(v, 96, midi_out_channel)
     end
+    active_notes[k] = nil
   end
 end
 
 
 -- Beat clock
 
+local function start_sequence(id)
+  sequences[id] = 1
+end
+
+local function stop_sequence(id)
+  sequences[id] = nil
+end
+
 local function advance_step()
   
   if #notes == params:get("num_steps") then
     
     -- Note offs
-    for _, n in pairs(notes) do
-      if n.active then
-        note_off(n.num)
-        n.active = false
-      end
+    for k, v in pairs(active_notes) do
+      note_off(k)
+      active_notes[k] = nil
     end
     
-    -- Advance
-    current_step = current_step % params:get("num_steps") + 1
-    
-    -- Note on
-    note_on(notes[current_step].num)
-    notes[current_step].active = true
+    -- Advance and note on
+    for id, step in pairs(sequences) do
+      local next_step = step % params:get("num_steps") + 1
+      local note_id = notes[next_step].num
+      if id ~= "internal" then
+        note_id = note_id + id - 60
+      end
+      if not active_notes[note_id] then
+        note_on(note_id)
+        active_notes[note_id] = step
+      end
+      sequences[id] = next_step
+    end
     
     screen_dirty = true
   
@@ -130,12 +142,16 @@ end
 
 local function stop()
   all_notes_kill()
-  current_step = 0
+  for _, step in pairs(sequences) do
+    step = 1
+  end
   beat_clock:reset()
 end
 
 local function reset_step()
-  current_step = 0
+  for _, step in pairs(sequences) do
+    step = 1
+  end
   beat_clock:reset()
   -- TODO does this call stop or do I need to kill notes here?
 end
@@ -297,7 +313,6 @@ local function generate_notes()
       note.num = scale[scale_position]
       note.x = util.round(util.linlin(1, params:get("num_steps"), 0, stock_graph:get_width(), i) + stock_graph:get_x())
       note.y = util.round(util.linlin(1, scale_len, stock_graph:get_height(), 0, scale_position) + stock_graph:get_y())
-      note.active = i == current_step
       table.insert(notes, note)
     end
   
@@ -339,10 +354,10 @@ function key(n, z)
   if z == 1 and not downloading then
     if n == 2 then
       
-      if beat_clock.playing then
-        beat_clock:stop()
+      if sequences.internal then
+        sequences.internal = nil
       else
-        beat_clock:start()
+        sequences.internal = 1
       end
       
     elseif n == 3 then
@@ -370,9 +385,13 @@ end
 
 -- MIDI events
 local function midi_event(data)
-  local msg = Midi.to_msg(data)
+  local msg = midi.to_msg(data)
   if msg.ch == midi_in_channel then
-    print("MIDI in TODO", msg.type, msg)
+    if msg.type == "note_on" then
+      start_sequence(msg.note)
+    elseif msg.type == "note_off" then
+      stop_sequence(msg.note)
+    end
   end
 end
 
@@ -461,7 +480,7 @@ function init()
     
   params:add_separator()
   
-  Passersby.add_params()
+  MollyThePoly.add_params()
   
   midi_in_channel = params:get("midi_in_channel")
   midi_out_channel = params:get("midi_out_channel")
@@ -551,8 +570,12 @@ function redraw()
         local BACK_SIZE = 6.5
         local FRONT_SIZE = 3.5
         
-        for _, n in pairs(notes) do
-          if n.active then
+        local note_level = 15
+        
+        for _, v in pairs(active_notes) do
+          if notes[v] then
+            
+            local n = notes[v]
             
             screen.move(n.x, n.y - BACK_SIZE)
             screen.line(n.x + BACK_SIZE, n.y)
@@ -567,8 +590,10 @@ function redraw()
             screen.line(n.x, n.y + FRONT_SIZE)
             screen.line(n.x - FRONT_SIZE, n.y)
             screen.close()
-            screen.level(15)
+            screen.level(note_level)
             screen.stroke()
+            
+            note_level = math.max(3, note_level - 3)
           end
         end
         
