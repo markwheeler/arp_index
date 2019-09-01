@@ -19,8 +19,9 @@ engine.name = "MollyThePoly"
 
 local options = {}
 options.OUTPUT = {"Audio", "MIDI", "Audio + MIDI"}
-options.STEP_LENGTH_NAMES = {"1 bar", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12", "1/16", "1/24", "1/32", "1/48", "1/64"}
-options.STEP_LENGTH_DIVIDERS = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}
+options.STEP_LENGTH_NAMES = {"1 bar", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12", "1/16", "1/24", "1/32"}
+options.STEP_LENGTH_DIVIDERS = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}
+options.SCALE_NAMES = {}
 
 local RANGES = {"1d", "1m", "3m", "1y"}
 local RANGE_NAMES = {"1 day", "1 month", "3 months", "1 year"}
@@ -43,6 +44,8 @@ local notes = {}
 local scale
 local sequences = {internal = 1}
 local active_notes = {}
+local step_on = true
+local need_to_switch = false
 
 local stock_graph
 
@@ -52,6 +55,11 @@ local midi_in_device
 local midi_in_channel
 local midi_out_device
 local midi_out_channel
+
+
+local function format_note_num(param)
+  return MusicUtil.note_num_to_name(param:get(), true)
+end
 
 
 local function note_on(note_num)
@@ -101,62 +109,6 @@ local function all_notes_kill()
 end
 
 
--- Beat clock
-
-local function start_sequence(id)
-  sequences[id] = 1
-end
-
-local function stop_sequence(id)
-  sequences[id] = nil
-end
-
-local function advance_step()
-  
-  if #notes == params:get("num_steps") then
-    
-    -- Note offs
-    for k, v in pairs(active_notes) do
-      note_off(k)
-      active_notes[k] = nil
-    end
-    
-    -- Advance and note on
-    for id, step in pairs(sequences) do
-      local next_step = step % params:get("num_steps") + 1
-      local note_id = notes[next_step].num
-      if id ~= "internal" then
-        note_id = note_id + id - 60
-      end
-      if not active_notes[note_id] then
-        note_on(note_id)
-        active_notes[note_id] = step
-      end
-      sequences[id] = next_step
-    end
-    
-    screen_dirty = true
-  
-  end
-end
-
-local function stop()
-  all_notes_kill()
-  for _, step in pairs(sequences) do
-    step = 1
-  end
-  beat_clock:reset()
-end
-
-local function reset_step()
-  for _, step in pairs(sequences) do
-    step = 1
-  end
-  beat_clock:reset()
-  -- TODO does this call stop or do I need to kill notes here?
-end
-
-
 -- Get data
 
 local function curl_request(url)
@@ -175,7 +127,8 @@ local function process_companies_json(json)
     table.insert(companies, {
       symbol = string.match(entry, "\"symbol\":\"(.-)\""),
       name =  string.match(entry, "\"companyName\":\"(.-)\""),
-      data = {}
+      data = {},
+      preset = {}
     })
   end
   table.sort(companies, function (k1, k2) return k1.symbol < k2.symbol end)
@@ -272,6 +225,62 @@ local function get_stock_prices(symbol)
   print("Got all", symbol)
 end
 
+local function generate_synth_preset()
+  MollyThePoly.randomize_params("lead")
+end
+
+local function store_synth_preset()
+  
+  local param_names = {
+    "osc_wave_shape",
+    "pulse_width_mod",
+    "pulse_width_mod_src",
+    "freq_mod_lfo",
+    "freq_mod_env",
+    "glide",
+    "main_osc_level",
+    "sub_osc_level",
+    "sub_osc_detune",
+    "noise_level",
+    "hp_filter_cutoff",
+    "lp_filter_cutoff",
+    "lp_filter_resonance",
+    "lp_filter_type",
+    "lp_filter_env",
+    "lp_filter_mod_env",
+    "lp_filter_mod_lfo",
+    "lp_filter_tracking",
+    "lfo_freq",
+    "lfo_wave_shape",
+    "lfo_fade",
+    "env_1_attack",
+    "env_1_decay",
+    "env_1_sustain",
+    "env_1_release",
+    "env_2_attack",
+    "env_2_decay",
+    "env_2_sustain",
+    "env_2_release",
+    "amp",
+    "amp_mod",
+    "ring_mod_freq",
+    "ring_mod_fade",
+    "ring_mod_mix",
+    "chorus_mix",
+  }
+  
+  for _, v in pairs(param_names) do
+    companies[current_company_id].preset[v] = params:get(v)
+  end
+  
+end
+
+local function switch_synth_preset()
+  for k, v in pairs(companies[current_company_id].preset) do
+    params:set(k, v)
+  end
+end
+
 local function update_stock_graph()
   
   stock_graph:remove_all_points()
@@ -290,6 +299,10 @@ local function update_stock_graph()
     stock_graph:set_y_max(data.max_price)
   
   end
+end
+
+local function generate_scale()
+  scale = MusicUtil.generate_scale(params:get("scale_root"), params:get("scale_type"), params:get("octaves"))
 end
 
 local function generate_notes()
@@ -320,6 +333,75 @@ local function generate_notes()
 end
 
 
+-- Beat clock
+
+local function start_sequence(id)
+  sequences[id] = 1
+end
+
+local function stop_sequence(id)
+  sequences[id] = nil
+end
+
+local function advance_step()
+  
+  if step_on then
+    
+    if #notes == params:get("num_steps") then
+      
+      if need_to_switch then
+        switch_synth_preset()
+        need_to_switch = false
+      end
+      
+      -- Advance and note on
+      for id, step in pairs(sequences) do
+        local next_step = step % params:get("num_steps") + 1
+        local note_id = notes[next_step].num
+        if id ~= "internal" then
+          note_id = note_id + id - 60
+        end
+        if not active_notes[note_id] then
+          note_on(note_id)
+          active_notes[note_id] = step
+        end
+        sequences[id] = next_step
+      end
+      
+      screen_dirty = true
+    
+    end
+    
+  else
+    
+    -- Note offs
+    for k, v in pairs(active_notes) do
+      note_off(k)
+      active_notes[k] = nil
+    end
+    
+  end
+  
+  step_on = not step_on
+end
+
+local function stop()
+  all_notes_kill()
+  for _, step in pairs(sequences) do
+    step = 1
+  end
+  beat_clock:reset()
+end
+
+local function reset_step()
+  for _, step in pairs(sequences) do
+    step = 1
+  end
+  beat_clock:reset()
+  -- TODO does this call stop or do I need to kill notes here?
+end
+
+
 -- Encoder input
 function enc(n, delta)
   
@@ -329,7 +411,11 @@ function enc(n, delta)
     
     if n == 1 then
       if num_companies > 0 then
+        if not need_to_switch then -- Don't store if we haven't had time to switch
+          store_synth_preset()
+        end
         current_company_id = util.clamp(current_company_id + delta, 1, num_companies)
+        need_to_switch = true
         generate_notes()
         update_stock_graph()
       end
@@ -354,6 +440,7 @@ function key(n, z)
   if z == 1 and not downloading then
     if n == 2 then
       
+      -- Stop / play
       if sequences.internal then
         sequences.internal = nil
       else
@@ -364,8 +451,11 @@ function key(n, z)
       
       if num_companies > 0 then
       
+        -- Download stock history and generate preset
         if not companies[current_company_id].data[current_range_id] then
           get_stock_prices(companies[current_company_id].symbol)
+          generate_synth_preset()
+          store_synth_preset()
           generate_notes()
           update_stock_graph()
         end
@@ -398,11 +488,13 @@ end
 
 function init()
   
+  for _, v in ipairs(MusicUtil.SCALES) do
+    table.insert(options.SCALE_NAMES, v.name)
+  end
+  
   stock_graph = Graph.new(1, 10, "lin", 0, 100, "lin", "line", false, false)
   stock_graph:set_position_and_size(4, 27, 120, 34)
   stock_graph:set_active(false)
-  
-  scale = MusicUtil.generate_scale(60, "major", 1)
   
   midi_in_device = midi.connect(1)
   midi_in_device.event = midi_event
@@ -422,8 +514,6 @@ function init()
   
   beat_clock.on_step = advance_step
   beat_clock.on_stop = stop
-  
-  get_companies()
   
   -- Add params
   
@@ -467,7 +557,7 @@ function init()
   params:add{type = "option", id = "step_length", name = "Step Length", options = options.STEP_LENGTH_NAMES, default = 8,
     action = function(value)
       beat_clock.ticks_per_step = 96 / options.STEP_LENGTH_DIVIDERS[value]
-      beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 4
+      beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 2
       beat_clock:bpm_change(beat_clock.bpm)
     end}
     
@@ -478,12 +568,32 @@ function init()
       generate_notes()
     end}
     
+  params:add{type = "number", id = "scale_root", name = "Scale Root", min = 0, max = 127, default = 60, formatter = format_note_num, 
+    action = function(value)
+      generate_scale()
+      generate_notes()
+    end}
+    
+  params:add{type = "option", id = "scale_type", name = "Scale", options = options.SCALE_NAMES, default = 1,
+    action = function(value)
+      generate_scale()
+      generate_notes()
+    end}
+    
+  params:add{type = "number", id = "octaves", name = "Octaves", min = 1, max = 4, default = 1,
+    action = function(value)
+      generate_scale()
+      generate_notes()
+    end}
+    
   params:add_separator()
   
   MollyThePoly.add_params()
   
   midi_in_channel = params:get("midi_in_channel")
   midi_out_channel = params:get("midi_out_channel")
+  
+  get_companies()
 
   -- Start metros
   screen.aa(1)  
@@ -572,7 +682,7 @@ function redraw()
         
         local note_level = 15
         
-        for _, v in pairs(active_notes) do
+        for _, v in pairs(sequences) do
           if notes[v] then
             
             local n = notes[v]
