@@ -2,9 +2,15 @@
 -- 1.0.0 @markeats
 -- llllllll.co/t/arp-index
 --
--- xxxxxxxxxx.
+-- Check the stock market.
+-- Requires internet.
 --
--- E1 : Xxxxxx
+-- E1 : Company
+-- E2 : Time span
+-- E3 : Steps
+-- K2 : Play/Stop
+-- K1+K2 : Reset clock
+-- K3 : Refresh
 --
 -- Data provided by http://iexcloud.io
 --
@@ -30,6 +36,8 @@ local API_BASE_URL = "https://cloud.iexapis.com/v1/"
 
 local SCREEN_FRAMERATE = 15
 local screen_dirty = true
+
+local shift_mode = false
 
 local downloading = false
 local steps_changed_timeout = 0
@@ -113,7 +121,7 @@ end
 
 local function curl_request(url)
   print("Requesting...", url)
-  return util.os_capture( "curl -s \"" .. url .. "\"", true)
+  return util.os_capture( "curl -sS --max-time 20 \"" .. url .. "\"", true)
 end
 
 local function get_companies_json()
@@ -134,6 +142,11 @@ local function process_companies_json(json)
   table.sort(companies, function (k1, k2) return k1.symbol < k2.symbol end)
   
   num_companies = #companies
+  
+  if num_companies < 1 then
+    print("Error proessing companies", json)
+  end
+  
   current_company_id = util.clamp(current_company_id, 1, num_companies)
   downloading = false
   screen_dirty = true
@@ -186,6 +199,11 @@ local function process_stock_price_json(json, range)
     end
   end
   
+  if #data.price_history < 1 then
+    print("Error processing prices", json)
+    return
+  end
+  
   if range == "1d" then
     price_change = util.round(data.price_history[#data.price_history] - data.price_history[1], 0.001)
   end
@@ -226,7 +244,13 @@ local function get_stock_prices(symbol)
 end
 
 local function generate_synth_preset()
-  MollyThePoly.randomize_params("lead")
+  
+  if math.random() > 0.9 then
+    MollyThePoly.randomize_params("percussion")
+  else
+    MollyThePoly.randomize_params("lead")
+  end
+  
 end
 
 local function store_synth_preset()
@@ -336,7 +360,7 @@ end
 -- Beat clock
 
 local function start_sequence(id)
-  sequences[id] = 1
+  sequences[id] = 0
 end
 
 local function stop_sequence(id)
@@ -437,14 +461,33 @@ end
 
 -- Key input
 function key(n, z)
+  
+  if n == 1 then
+    shift_mode = z == 1
+  end
+  
   if z == 1 and not downloading then
     if n == 2 then
       
-      -- Stop / play
-      if sequences.internal then
-        sequences.internal = nil
+      if shift_mode then
+        
+        -- Reset clock
+        beat_clock:reset()
+        for k, v in pairs(sequences) do
+          if v then
+            sequences[k] = 0
+          end
+        end
+        
       else
-        sequences.internal = 1
+        
+        -- Stop / play
+        if sequences.internal then
+          sequences.internal = nil
+        else
+          sequences.internal = 0
+        end
+        
       end
       
     elseif n == 3 then
@@ -458,6 +501,12 @@ function key(n, z)
           store_synth_preset()
           generate_notes()
           update_stock_graph()
+          
+        -- Generate a new preset
+        else
+          generate_synth_preset()
+          store_synth_preset()
+          
         end
         
       else
