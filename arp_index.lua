@@ -1,6 +1,6 @@
 -- The Arp Index
 -- 1.0.0 @markeats
--- llllllll.co/t/arp-index
+-- llllllll.co/t/the-arp-index
 --
 -- Check the stock market.
 -- Requires internet.
