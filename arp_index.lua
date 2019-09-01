@@ -12,7 +12,8 @@
 -- K1+K2 : Reset clock
 -- K3 : Refresh
 --
--- Data provided by http://iexcloud.io
+-- Data provided by
+-- http://iexcloud.io
 --
 
 local ControlSpec = require "controlspec"
