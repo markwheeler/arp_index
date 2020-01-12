@@ -1,5 +1,5 @@
 -- The Arp Index
--- 1.0.0 @markeats
+-- 1.0.1 @markeats
 -- llllllll.co/t/the-arp-index
 --
 -- Check the stock market.
@@ -689,11 +689,7 @@ function redraw()
     
       -- Symbol and name
       local title = companies[current_company_id].symbol .. " " .. companies[current_company_id].name
-      if title:len() > 25 then
-        title = string.sub(title, 1, 25)
-        title = string.gsub(title, "[%p%s]+$", "") -- Trim punctuation and spaces
-        title = title .. "..."
-      end
+      title = util.trim_string_to_width(title, 122)
       screen.move(3, 9)
       screen.level(3)
       screen.text(title)
