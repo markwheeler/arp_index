@@ -535,6 +535,10 @@ local function midi_event(data)
   end
 end
 
+local function midi_clock_event(data)
+  beat_clock:process_midi(data)
+end
+
 
 function init()
   
@@ -545,9 +549,24 @@ function init()
   stock_graph = Graph.new(1, 10, "lin", 0, 100, "lin", "line", false, false)
   stock_graph:set_position_and_size(4, 27, 120, 34)
   stock_graph:set_active(false)
+
+  beat_clock = BeatClock.new()
+  
+  beat_clock.on_step = advance_step
+  beat_clock.on_stop = stop
+
+  beat_clock.on_select_internal = function()
+    beat_clock:start()
+  end
+  beat_clock.on_select_external = function()
+    reset_step()
+  end
   
   midi_in_device = midi.connect(1)
   midi_in_device.event = midi_event
+
+  midi_clock_in_device = midi.connect(1)
+  midi_clock_in_device.event = midi_clock_event
   
   midi_out_device = midi.connect(1)
   
@@ -559,11 +578,6 @@ function init()
       redraw()
     end
   end
-  
-  beat_clock = BeatClock.new()
-  
-  beat_clock.on_step = advance_step
-  beat_clock.on_stop = stop
   
   -- Add params
   
@@ -591,6 +605,18 @@ function init()
       all_notes_kill()
       midi_out_channel = value
     end}
+
+  params:add{type = "option", id = "clock", name = "Clock", options = {"Internal", "External"}, default = beat_clock.external or 2 and 1,
+    action = function(value)
+      beat_clock:clock_source_change(value)
+    end}
+  
+  params:add{type = "number", id = "midi_clock_in_device", name = "Clock MIDI In Device", min = 1, max = 4, default = 1,
+    action = function(value)
+      midi_clock_in_device.event = nil
+      midi_clock_in_device = midi.connect(value)
+      midi_clock_in_device.event = midi_clock_event
+    end}
   
   params:add{type = "option", id = "clock_out", name = "Clock Out", options = {"Off", "On"}, default = beat_clock.send or 2 and 1,
     action = function(value)
@@ -607,7 +633,7 @@ function init()
   params:add{type = "option", id = "step_length", name = "Step Length", options = options.STEP_LENGTH_NAMES, default = 8,
     action = function(value)
       beat_clock.ticks_per_step = 96 / options.STEP_LENGTH_DIVIDERS[value]
-      beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 2
+      beat_clock.steps_per_beat = options.STEP_LENGTH_DIVIDERS[value] / 4
       beat_clock:bpm_change(beat_clock.bpm)
     end}
     
